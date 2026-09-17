@@ -1,0 +1,517 @@
+REM /**
+REM  * CustomerFormProcedural.bbj
+REM  *
+REM  * Sample DWC customer input form written in procedural BBj (labels, GOSUB and DEF FN).
+REM  * An object-oriented version of the same form is in CustomerFormOOP.bbj.
+REM  *
+REM  * This single file holds everything the sample needs, including its CSS. It shows:
+REM  *   - Labels, placeholders, helper text and tooltips on each input
+REM  *   - Required fields, with a REQUIRED marker on the field label
+REM  *   - Client-side validation that runs in the browser, with custom invalid-input messages
+REM  *   - Input masks for the phone number and date of birth
+REM  *   - Browser autofill, driven by each field's autocomplete attribute
+REM  *   - Cookies, which remember the customer's contact details on this device
+REM  *   - Form validation on the Submit button (ON_FORM_VALIDATION), which also
+REM  *     checks the values again on the server
+REM  *   - A responsive layout that runs equally well on a desktop, tablet or phone:
+REM  *     Automatic Layout hands positioning to CSS grid and flexbox, and a media
+REM  *     query stacks the form into a single column on narrow screens
+REM  *
+REM  * Each input's label comes from its "label" attribute, set with
+REM  * setAttribute("label", ...), rather than from a separate BBjStaticText control
+REM  * placed next to it. That is better in three ways:
+REM  *   - Fewer controls to create and manage
+REM  *   - BBj lays out and positions the label with its input, so the two can never
+REM  *     drift apart when the layout changes size
+REM  *   - The label is tied to its input, so screen readers announce it
+REM  *
+REM  * Runs in the DWC only: register it as an application in Enterprise Manager and
+REM  * open it at http://<server>:8888/webapp/<AppName>
+REM  */
+
+use java.net.URLDecoder
+use java.net.URLEncoder
+use java.util.regex.Pattern
+
+declare BBjSysGui               sysGui!
+declare BBjWebManager           webManager!
+declare BBjThinClient           thinClient!
+declare BBjTopLevelWindow       window!
+declare BBjChildWindow          formCard!
+declare BBjChildWindow          nameRow!
+declare BBjChildWindow          buttonRow!
+declare BBjStaticText           title!
+declare BBjStaticText           intro!
+declare BBjEditBox              firstNameInput!
+declare BBjEditBox              middleInitialInput!
+declare BBjEditBox              lastNameInput!
+declare BBjEditBox              emailInput!
+declare BBjInputE               phoneInput!
+declare BBjInputD               birthInput!
+declare BBjListButton           contactMethodInput!
+declare BBjCheckBox             rememberMeInput!
+declare BBjButton               submitButton!
+declare BBjButton               clearButton!
+declare BBjButton               forgetButton!
+declare BBjVector               contactMethods!
+declare BBjVector               errors!
+declare BBjFormValidationEvent  formEvent!
+
+REM Prefix on every cookie name, so this form's cookies can't collide with another app's
+cookiePrefix$ = "dwcCustomerForm_"
+emailPattern$ = "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+phonePattern$ = "[2-9][0-9]{9}"
+
+
+REM ======================================== UTILITY FUNCTIONS ========================================
+
+REM Reads a cookie saved with fnSetCookie(); returns "" if there is no such cookie
+def fnGetCookie$(name$)
+    cookieValue$ = ""
+    rawCookie! = null()
+    REM getUserProperty() throws !ERROR=11 when the cookie doesn't exist
+    rawCookie! = thinClient!.getUserProperty(BBjThinClient.USER_PROPERTIES_COOKIES, cookiePrefix$ + name$, err=*NEXT)
+    if (rawCookie! <> null()) then cookieValue$ = URLDecoder.decode(str(rawCookie!), "UTF-8", err=*NEXT)
+    return cookieValue$
+fnend
+
+REM Saves a value in a browser cookie (the DWC keeps it for 30 days); always returns 1
+def fnSetCookie(name$, value$)
+    REM Encode the value so characters such as spaces, commas and semicolons survive in the cookie
+    thinClient!.setUserProperty(BBjThinClient.USER_PROPERTIES_COOKIES, cookiePrefix$ + name$, URLEncoder.encode(value$, "UTF-8"))
+    return 1
+fnend
+
+REM Deletes a cookie saved with fnSetCookie(); always returns 1
+def fnRemoveCookie(name$)
+    REM A null value deletes the cookie. (Setting an already-expired cookie also removes it, but the
+    REM browser then can't read the cookie back to confirm the write, so BBj reports !ERROR=17.)
+    thinClient!.setUserProperty(BBjThinClient.USER_PROPERTIES_COOKIES, cookiePrefix$ + name$, null())
+    return 1
+fnend
+
+REM Returns 1 if the email address is valid, otherwise 0
+def fnIsValidEmail(email$)
+    if (Pattern.matches(emailPattern$, email$)) then return 1
+    return 0
+fnend
+
+REM Returns 1 if the phone number is a valid 10-digit US number, otherwise 0; anything other than digits is ignored
+def fnIsValidPhone(phone$)
+    if (Pattern.matches(phonePattern$, fnDigitsOnly$(phone$))) then return 1
+    return 0
+fnend
+
+REM Returns only the digits in the given text
+def fnDigitsOnly$(text$)
+    digitsText! = text$
+    return str(digitsText!.replaceAll("[^0-9]", ""))
+fnend
+
+REM Returns 1 if someone born on the julian date birthDate is at least minYears old today, otherwise 0
+def fnIsAtLeastAge(birthDate, minYears)
+    if (birthDate <= 0) then return 0
+    ageToday = jul(0, 0, 0)
+    cutoffYear = num(date(ageToday:"%Yl")) - minYears
+    cutoffMonth = num(date(ageToday:"%Mz"))
+    cutoffDay = num(date(ageToday:"%Dz"))
+    REM When today is February 29, the same date years ago may not exist, so use February 28
+    cutoff = -1
+    cutoff = jul(cutoffYear, cutoffMonth, cutoffDay, err=*NEXT)
+    if (cutoff < 0) then cutoff = jul(cutoffYear, cutoffMonth, cutoffDay - 1)
+    if (birthDate <= cutoff) then return 1
+    return 0
+fnend
+
+REM Returns a 10-digit phone number formatted as (123) 456-7890
+def fnFormatPhone$(phone$)
+    if (len(phone$) <> 10) then return phone$
+    return "(" + phone$(1, 3) + ") " + phone$(4, 3) + "-" + phone$(7, 4)
+fnend
+
+
+REM Escapes text typed by the customer so it displays as-is inside HTML instead of being read as markup
+def fnEscapeHtml$(text$)
+    htmlText! = text$
+    REM BBj reads a single & in control and message text specially, so each entity starts with &&
+    return str(htmlText!.replace("&", "&&amp;").replace("<", "&&lt;").replace(">", "&&gt;"))
+fnend
+
+REM Builds one label/value row for the HTML summary table; the value is HTML-escaped
+def fnHtmlRow$(label$, value$)
+    return "<tr><th style='text-align: left; padding: 4px 16px 4px 0; white-space: nowrap'>" + label$ + "</th><td style='padding: 4px 0'>" + fnEscapeHtml$(value$) + "</td></tr>"
+fnend
+
+
+REM ======================================== PROGRAM START ========================================
+REM A dropped client connection will trigger a SETESC interrupt
+BBjAPI().getConfig().releaseOnLostConnection(0)
+SETESC ESCAPE_HANDLER
+
+sysGui! = BBjAPI().openSysGui("X0")
+webManager! = BBjAPI().getWebManager()
+thinClient! = BBjAPI().getThinClient()
+webManager!.setTheme("system")
+
+contactMethods! = BBjAPI().makeVector()
+contactMethods!.addItem("Email")
+contactMethods!.addItem("Phone call")
+contactMethods!.addItem("Text message")
+
+gosub INJECT_CSS
+gosub BUILD_FORM
+gosub LOAD_SAVED_VALUES
+
+window!.setVisible(1)
+firstNameInput!.focus()
+process_events
+
+
+REM ======================================== EVENT HANDLERS ========================================
+
+REM Handles the Submit button. The browser has already validated every field, but browser checks
+REM can be bypassed, so the values are checked again here before they are used.
+ON_SUBMIT:
+    formEvent! = cast(BBjFormValidationEvent, BBjAPI().getLastEvent())
+
+    REM The event holds every value on the form, so reading them takes no extra round trips
+    firstName$ = cvs(formEvent!.getText(firstNameInput!), 3)
+    middleInitial$ = cvs(formEvent!.getText(middleInitialInput!), 3 + 4)
+    lastName$ = cvs(formEvent!.getText(lastNameInput!), 3)
+    email$ = cvs(formEvent!.getText(emailInput!), 3)
+    phone$ = fnDigitsOnly$(formEvent!.getText(phoneInput!))
+    birthDate = formEvent!.getValue(birthInput!)
+    contactIndex = formEvent!.getSelectedIndex(contactMethodInput!)
+    remember = formEvent!.isSelected(rememberMeInput!)
+
+    REM ----- Server-side validation -----
+    errors! = BBjAPI().makeVector()
+    if (firstName$ = "") then errors!.addItem("First name is required")
+    if (middleInitial$ <> "" and Pattern.matches("[A-Z]", middleInitial$) = 0) then errors!.addItem("Middle initial must be a single letter")
+    if (lastName$ = "") then errors!.addItem("Last name is required")
+    if (fnIsValidEmail(email$) = 0) then errors!.addItem("Enter a valid email address")
+    if (fnIsValidPhone(phone$) = 0) then errors!.addItem("Enter a valid 10-digit US phone number")
+    if (fnIsAtLeastAge(birthDate, 18) = 0) then errors!.addItem("You must be at least 18 years old")
+    if (contactIndex < 0) then errors!.addItem("Choose how we should contact you")
+
+    if (errors!.size() > 0) then
+        REM accept(0) rejects the submission and unlocks the window so the customer can fix it.
+        REM Every ON_FORM_VALIDATION callback must call accept(), or the window stays locked.
+        formEvent!.accept(0)
+        message$ = "<html><p style='margin: 0 0 8px 0'>Please correct the following:</p><ul style='margin: 0; padding-left: 20px'>"
+        for i = 0 to errors!.size() - 1
+            message$ = message$ + "<li>" + str(errors!.getItem(i)) + "</li>"
+        next
+        message$ = message$ + "</ul></html>"
+        x = msgbox(message$, BBjSysGui.MSGBOX_ICON_EXCLAMATION, "Customer Information", mode="theme=warning")
+        return
+    endif
+
+    contactMethod$ = str(contactMethods!.getItem(contactIndex))
+
+    REM ----- Remember or forget the customer on this device -----
+    if (remember) then gosub SAVE_COOKIES else gosub CLEAR_COOKIES
+
+    formEvent!.accept(1)
+
+    REM This is where a real application would save the customer record. Here, every value that
+    REM came from the form validation event is shown in a message box. A message that starts with
+    REM <html> is rendered as HTML, so the values can be laid out in a table.
+    summary$ = "<html>"
+    summary$ = summary$ + "<h3 style='margin: 0 0 4px 0'>Thank you, " + fnEscapeHtml$(firstName$) + "!</h3>"
+    summary$ = summary$ + "<p style='margin: 0 0 12px 0'>These are the values the server received from the form validation event:</p>"
+    summary$ = summary$ + "<table style='border-collapse: collapse'>"
+    summary$ = summary$ + fnHtmlRow$("First Name", firstName$)
+    summary$ = summary$ + fnHtmlRow$("Middle Initial", iff(middleInitial$ = "", "(none)", middleInitial$))
+    summary$ = summary$ + fnHtmlRow$("Last Name", lastName$)
+    summary$ = summary$ + fnHtmlRow$("Email", email$)
+    summary$ = summary$ + fnHtmlRow$("Mobile Number", fnFormatPhone$(phone$))
+    summary$ = summary$ + fnHtmlRow$("Date of Birth", date(birthDate:"%Mz/%Dz/%Yl"))
+    summary$ = summary$ + fnHtmlRow$("Contact Method", contactMethod$)
+    summary$ = summary$ + fnHtmlRow$("Remember Me", iff(remember, "Yes", "No"))
+    summary$ = summary$ + "</table></html>"
+    x = msgbox(summary$, BBjSysGui.MSGBOX_ICON_INFORMATION, "Customer Information", mode="theme=success")
+
+    REM MSGBOX waits until the customer dismisses it, so the program ends once they have read the summary
+release
+
+
+REM Empties every field on the form. The saved cookies are left alone.
+ON_CLEAR:
+    firstNameInput!.setText("")
+    middleInitialInput!.setText("")
+    lastNameInput!.setText("")
+    emailInput!.setText("")
+    phoneInput!.setText("")
+    birthInput!.setText("")
+    contactMethodInput!.deselect()
+    rememberMeInput!.setSelected(0)
+    firstNameInput!.focus()
+return
+
+
+REM Deletes the contact details saved in cookies on this device. The fields on the form are left as they are.
+ON_FORGET:
+    gosub CLEAR_COOKIES
+    rememberMeInput!.setSelected(0)
+    x = msgbox("Your saved contact details have been removed from this device.", BBjSysGui.MSGBOX_ICON_INFORMATION, "Customer Information", mode="theme=info")
+return
+
+
+REM Ends the program when the window is closed
+ON_CLOSE:
+release
+
+
+REM Handles an escape interrupt, which a dropped browser connection also triggers
+ESCAPE_HANDLER:
+    if and(chr(tcb(19)), $08$) = $08$ then
+        REM The browser connection was lost, so log it to the BBjServices debug log
+        System.out.println($0a$ + "** CustomerFormProcedural Error Start **" + $0a09$ + "Date and Time: " + date(0:"%Y-%Mz-%Dz  %Hz:%mz:%sz") + $0a09$ + "ESCAPE_HANDLER: lost connection to the client" + $0a$ + "** CustomerFormProcedural Error End **", err=*NEXT)
+    endif
+release
+
+
+REM ======================================== SUBROUTINES ========================================
+
+REM Creates the window and every control on the form
+BUILD_FORM:
+    REM Automatic Layout ($00100000$) lets CSS position the controls, so no coordinates are needed
+    window! = sysGui!.addWindow("Customer Information", $011C1091$)
+    window!.addClass("customer-form-app")
+    window!.setCallback(BBjTopLevelWindow.ON_CLOSE, "ON_CLOSE")
+    BBjAPI().getWebManager().setCallback(BBjWebManager.ON_BROWSER_CLOSE, "ON_CLOSE")
+
+    formCard! = window!.addChildWindow("", $00108800$, sysGui!.getAvailableContext())
+    formCard!.addClass("customer-form")
+
+    title! = formCard!.addStaticText("Customer Information")
+    title!.addClass("customer-form__title full-width")
+
+    intro! = formCard!.addStaticText("Fields marked REQUIRED must be filled in before you can submit the form.")
+    intro!.addClass("customer-form__intro full-width")
+
+    REM ----- Name row: first name, middle initial, last name -----
+    nameRow! = formCard!.addChildWindow("", $00108800$, sysGui!.getAvailableContext())
+    nameRow!.addClass("customer-form__names full-width")
+
+    firstNameInput! = nameRow!.addEditBox("")
+    firstNameInput!.setAttribute("label", "First Name")
+    firstNameInput!.setAttribute("placeholder", "First Name")
+    REM The autocomplete attribute tells the browser which saved value it can offer here
+    firstNameInput!.setAttribute("autocomplete", "given-name")
+    firstNameInput!.setAttribute("required", "true")
+    firstNameInput!.setAttribute("invalid-message", "First name is required")
+    firstNameInput!.setClientValidationFunction("value.trim().length > 0")
+    firstNameInput!.setToolTipText("Your legal first name")
+
+    middleInitialInput! = nameRow!.addEditBox("")
+    middleInitialInput!.setAttribute("label", "Middle Initial")
+    middleInitialInput!.setAttribute("placeholder", "M.I.")
+    middleInitialInput!.setAttribute("autocomplete", "additional-name")
+    middleInitialInput!.setAttribute("maxlength", "1")
+    middleInitialInput!.setAttribute("invalid-message", "Use a single letter")
+    REM Optional field: blank is valid, otherwise it must be a letter
+    middleInitialInput!.setClientValidationFunction("value.trim().length === 0 || /^[a-zA-Z]$/.test(value.trim())")
+    middleInitialInput!.setToolTipText("Optional")
+
+    lastNameInput! = nameRow!.addEditBox("")
+    lastNameInput!.setAttribute("label", "Last Name")
+    lastNameInput!.setAttribute("placeholder", "Last Name")
+    lastNameInput!.setAttribute("autocomplete", "family-name")
+    lastNameInput!.setAttribute("required", "true")
+    lastNameInput!.setAttribute("invalid-message", "Last name is required")
+    lastNameInput!.setClientValidationFunction("value.trim().length > 0")
+    lastNameInput!.setToolTipText("Your legal last name")
+
+    REM ----- Contact details -----
+    emailInput! = formCard!.addEditBox("")
+    emailInput!.setAttribute("label", "Email")
+    emailInput!.setAttribute("placeholder", "example@address.com")
+    emailInput!.setAttribute("autocomplete", "email")
+    emailInput!.setAttribute("required", "true")
+    REM auto-validate=false waits until Submit to validate, so the customer isn't told the
+    REM address is invalid while they are still typing it
+    emailInput!.setAttribute("auto-validate", "false")
+    emailInput!.setAttribute("invalid-message", "Enter a valid email address")
+    emailInput!.setClientValidationFunction("/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(value.trim())")
+    emailInput!.setToolTipText("We'll send your confirmation to this address")
+
+    phoneInput! = formCard!.addInputE()
+    phoneInput!.setAttribute("label", "Mobile Number")
+    phoneInput!.setMask("(000) 000-0000")
+    phoneInput!.setAttribute("placeholder", "(123) 456-7890")
+    phoneInput!.setAttribute("autocomplete", "tel-national")
+    phoneInput!.setAttribute("required", "true")
+    phoneInput!.setAttribute("auto-validate", "false")
+    phoneInput!.setAttribute("invalid-message", "Enter a valid 10-digit US phone number")
+    phoneInput!.setClientValidationFunction("/^[2-9]\d{9}$/.test(String(value).replace(/\D/g, ''))")
+    phoneInput!.setToolTipText("A 10-digit US number, area code first")
+
+    birthInput! = formCard!.addInputD()
+    birthInput!.setAttribute("label", "Date of Birth")
+    birthInput!.setMask("%Mz/%Dz/%Yl")
+    birthInput!.setAttribute("calendar-icon-visible", "true")
+    birthInput!.setAttribute("insert-mode", "true")
+    birthInput!.setAttribute("placeholder", "MM/DD/YYYY")
+    birthInput!.setAttribute("value", "")
+    birthInput!.setAttribute("autocomplete", "bday")
+    birthInput!.setAttribute("required", "true")
+    birthInput!.setAttribute("auto-validate", "false")
+    birthInput!.setAttribute("helper-text", "You must be at least 18 years old")
+    birthInput!.setAttribute("invalid-message", "You must be at least 18 years old")
+    REM The expression uses "return", so it is treated as a function body rather than a single expression
+    birthInput!.setClientValidationFunction("const today = new Date(); const cutoff = new Date(today.getFullYear() - 18, today.getMonth(), today.getDate()); return value !== null && value !== -1 && value <= cutoff;")
+    birthInput!.setToolTipText("Type the date or pick it from the calendar")
+
+    contactMethodInput! = formCard!.addListButton("")
+    contactMethodInput!.insertItems(0, contactMethods!)
+    contactMethodInput!.setAttribute("label", "Preferred Contact Method")
+    contactMethodInput!.setAttribute("placeholder", "Choose one")
+    contactMethodInput!.setAttribute("required", "true")
+    contactMethodInput!.setAttribute("invalid-message", "Choose how we should contact you")
+    contactMethodInput!.setClientValidationFunction("value !== null && value.length > 0")
+    contactMethodInput!.setToolTipText("How we'll reach you about your account")
+
+    rememberMeInput! = formCard!.addCheckBox("Remember my contact details on this device")
+    rememberMeInput!.setToolTipText("Saves your name, email, phone number and contact method in a cookie for 30 days")
+    rememberMeInput!.addClass("full-width")
+
+    REM ----- Buttons -----
+    buttonRow! = formCard!.addChildWindow("", $00108800$, sysGui!.getAvailableContext())
+    buttonRow!.addClass("customer-form__buttons full-width")
+
+    forgetButton! = buttonRow!.addButton("Forget Saved Details")
+    forgetButton!.setAttribute("theme", "outlined-danger")
+    forgetButton!.setToolTipText("Delete the contact details saved in a cookie on this device")
+    forgetButton!.addClass("customer-form__forget")
+    forgetButton!.setCallback(BBjButton.ON_BUTTON_PUSH, "ON_FORGET")
+
+    clearButton! = buttonRow!.addButton("Clear")
+    clearButton!.setToolTipText("Empty every field on the form")
+    clearButton!.setCallback(BBjButton.ON_BUTTON_PUSH, "ON_CLEAR")
+
+    submitButton! = buttonRow!.addButton("Submit")
+    submitButton!.setAttribute("theme", "primary")
+    submitButton!.setToolTipText("Check the form and send your information")
+    REM ON_FORM_VALIDATION runs the client-side validation first, and the handler only fires once every field is valid
+    submitButton!.setCallback(BBjButton.ON_FORM_VALIDATION, "ON_SUBMIT")
+return
+
+
+REM Fills the form from cookies saved by an earlier visit, if the customer asked to be remembered
+LOAD_SAVED_VALUES:
+    if (fnGetCookie$("remember") <> "1") then return
+
+    firstNameInput!.setText(fnGetCookie$("firstName"))
+    middleInitialInput!.setText(fnGetCookie$("middleInitial"))
+    lastNameInput!.setText(fnGetCookie$("lastName"))
+    emailInput!.setText(fnGetCookie$("email"))
+    phoneInput!.setText(fnGetCookie$("phone"))
+
+    contactIndex = contactMethods!.indexOf(fnGetCookie$("contactMethod"))
+    if (contactIndex >= 0) then contactMethodInput!.selectIndex(contactIndex)
+
+    rememberMeInput!.setSelected(1)
+return
+
+
+REM Saves the customer's contact details in cookies
+SAVE_COOKIES:
+    x = fnSetCookie("remember", "1")
+    x = fnSetCookie("firstName", firstName$)
+    x = fnSetCookie("middleInitial", middleInitial$)
+    x = fnSetCookie("lastName", lastName$)
+    x = fnSetCookie("email", email$)
+    x = fnSetCookie("phone", phone$)
+    x = fnSetCookie("contactMethod", contactMethod$)
+return
+
+
+REM Deletes every cookie this form saves
+CLEAR_COOKIES:
+    x = fnRemoveCookie("remember")
+    x = fnRemoveCookie("firstName")
+    x = fnRemoveCookie("middleInitial")
+    x = fnRemoveCookie("lastName")
+    x = fnRemoveCookie("email")
+    x = fnRemoveCookie("phone")
+    x = fnRemoveCookie("contactMethod")
+return
+
+
+REM Adds the form's CSS to the page. The CSS is kept here so the sample is a single file.
+INJECT_CSS:
+    css$ = ""
+
+    REM Give dropdowns (choice boxes and combo boxes) a height that lines up with the text fields
+    css$ = css$ + ":root {"
+    css$ = css$ + "  --dwc-choicebox-button-height: 2.55em;"
+    css$ = css$ + "  --dwc-combobox-field-height: var(--dwc-choicebox-button-height); }"
+
+    REM Center the form card in the window, and let it scroll on small screens
+    css$ = css$ + "dwc-window-center.customer-form-app > dwc-window-content {"
+    css$ = css$ + "  display: flex; justify-content: center; align-items: flex-start;"
+    css$ = css$ + "  overflow: auto; padding: var(--dwc-space-l, 16px); box-sizing: border-box; }"
+
+    REM Two-column grid for the fields
+    css$ = css$ + ".customer-form {"
+    css$ = css$ + "  display: grid; grid-template-columns: 1fr 1fr;"
+    css$ = css$ + "  gap: var(--dwc-space-xs, 4px) var(--dwc-space-m, 12px);"
+    css$ = css$ + "  width: min(720px, 100%); box-sizing: border-box;"
+    css$ = css$ + "  margin-top: var(--dwc-space-xl, 24px);"
+    css$ = css$ + "  padding: var(--dwc-space-xl, 24px);"
+    css$ = css$ + "  background: var(--dwc-surface-3);"
+    css$ = css$ + "  border-radius: var(--dwc-border-radius-l, 8px);"
+    css$ = css$ + "  box-shadow: var(--dwc-shadow-m); }"
+
+    css$ = css$ + ".customer-form__title { font-size: var(--dwc-font-size-2xl, 1.5rem); font-weight: 600; }"
+    css$ = css$ + ".customer-form__intro { margin-bottom: var(--dwc-space-m, 12px); opacity: 0.8; }"
+
+    REM First name, middle initial and last name share one row
+    css$ = css$ + ".customer-form__names {"
+    css$ = css$ + "  display: grid; grid-template-columns: 1fr 7rem 1fr;"
+    css$ = css$ + "  gap: var(--dwc-space-m, 12px); }"
+
+    css$ = css$ + ".customer-form__buttons {"
+    css$ = css$ + "  display: flex; justify-content: flex-end; flex-wrap: wrap;"
+    css$ = css$ + "  gap: var(--dwc-space-s, 8px); margin-top: var(--dwc-space-m, 12px); }"
+
+    REM The auto right margin pushes the other buttons to the right, keeping this one at the far left
+    css$ = css$ + ".customer-form__forget { margin-right: auto; }"
+
+    css$ = css$ + ".full-width { grid-column: 1 / -1; }"
+
+    REM Give every input control and button room for the keyboard focus ring. The ring is an outline drawn outside the
+    REM control, so without this padding it gets clipped by neighbouring controls and containers.
+    css$ = css$ + "dwc-field, dwc-textfield, dwc-datefield, dwc-choicebox, dwc-checkbox, dwc-radio, dwc-button {"
+    css$ = css$ + "  padding: calc(var(--dwc-focus-ring-width) + var(--dwc-focus-ring-gap)); }"
+
+    REM Show REQUIRED after the label of every required field; it turns red while the field has focus
+    css$ = css$ + "dwc-field[required]::part(label)::after,"
+    css$ = css$ + "dwc-textfield[required]::part(label)::after,"
+    css$ = css$ + "dwc-datefield[required]::part(label)::after,"
+    css$ = css$ + "dwc-choicebox[required]::part(label)::after {"
+    css$ = css$ + "  content: 'REQUIRED'; margin-left: 0.5em; font-size: 0.75em;"
+    css$ = css$ + "  color: var(--dwc-color-gray-75); opacity: 1;"
+    css$ = css$ + "  transition: color 150ms ease-in-out; }"
+    css$ = css$ + "dwc-field[required]:focus-within::part(label)::after,"
+    css$ = css$ + "dwc-textfield[required]:focus-within::part(label)::after,"
+    css$ = css$ + "dwc-datefield[required]:focus-within::part(label)::after,"
+    css$ = css$ + "dwc-choicebox[required]:focus-within::part(label)::after {"
+    css$ = css$ + "  color: var(--dwc-color-danger); }"
+
+    REM Emphasize REQUIRED while the mouse is over a required field. The font size stays the same so the label doesn't shift.
+    css$ = css$ + "dwc-field[required]:hover::part(label)::after,"
+    css$ = css$ + "dwc-textfield[required]:hover::part(label)::after,"
+    css$ = css$ + "dwc-datefield[required]:hover::part(label)::after,"
+    css$ = css$ + "dwc-choicebox[required]:hover::part(label)::after {"
+    css$ = css$ + "  color: var(--dwc-color-danger); font-weight: 700; }"
+
+    REM One column on narrow screens
+    css$ = css$ + "@media (max-width: 600px) {"
+    css$ = css$ + "  .customer-form, .customer-form__names { grid-template-columns: 1fr; }"
+    css$ = css$ + "  .customer-form { margin-top: 0; padding: var(--dwc-space-m, 12px); } }"
+
+    webManager!.injectStyle(css$, 0, "id=customer-form-css")
+return
